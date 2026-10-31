@@ -40,7 +40,7 @@ def setup_argparse():
     """
     parser = argparse.ArgumentParser(description="IaC Compliance Checker")
     parser.add_argument("-i", "--input", dest="input_file", required=True,
-                        help="Path to the IaC configuration file (e.g., Terraform, CloudFormation).")
+                        help="Path to the Terraform (HCL) IaC configuration file.")
     parser.add_argument("-r", "--rules", dest="rules_file", required=True,
                         help="Path to the compliance rules file (YAML).")
     parser.add_argument("-o", "--output", dest="output_file",
@@ -72,7 +72,7 @@ def load_iac_file(file_path):
             file_content = f.read()
 
         try:
-            # Assume Terraform (HCL2) for now.  Expand for other formats later (e.g., CloudFormation)
+            # Every input is parsed as Terraform HCL.
             data = hcl2.loads(file_content)
             return data
         except Exception as e:
@@ -145,24 +145,89 @@ def check_compliance(iac_data, rules):
         logging.error(f"Invalid rules data type: {type(rules)}. Expected dict.")
         raise InvalidInputError("Rules data must be a dictionary.")
 
-    # Basic example: Check if resource properties match expected values.
-    # This will need to be expanded significantly to handle more complex rules.
+    resources = list(_iter_resources(iac_data))
+    if not resources:
+        logging.error("No resources found in the IaC data; nothing was checked.")
+        raise InvalidInputError("No resources found in the IaC data; nothing was checked.")
+
     for resource_type, rule_set in rules.items():
-        if resource_type in iac_data:
-            for resource in iac_data[resource_type]:
-                for rule_name, rule_value in rule_set.items():
-                    if rule_name in resource:
-                         diff = DeepDiff(resource[rule_name], rule_value, ignore_order=True)
-                         if diff:
-                             violations.append({
-                                 "resource_type": resource_type,
-                                 "resource_name": resource.get("name", "N/A"),
-                                 "rule_name": rule_name,
-                                 "expected_value": rule_value,
-                                 "actual_value": resource[rule_name],
-                                 "difference": diff
-                             })
+        if not isinstance(rule_set, dict):
+            logging.error(f"Invalid rule set for resource type '{resource_type}'. Expected a dictionary of property rules.")
+            raise InvalidInputError(f"Rule set for resource type '{resource_type}' must be a dictionary.")
+        type_matched = False
+        for matched_type, resource_name, resource in resources:
+            if matched_type != resource_type:
+                continue
+            type_matched = True
+            for rule_name, rule_value in rule_set.items():
+                if rule_name not in resource:
+                    violations.append({
+                        "resource_type": resource_type,
+                        "resource_name": resource_name,
+                        "rule_name": rule_name,
+                        "expected_value": rule_value,
+                        "actual_value": None,
+                        "difference": f"{rule_name} is absent; expected {rule_value!r}"
+                    })
+                    continue
+                diff = DeepDiff(resource[rule_name], rule_value, ignore_order=True)
+                if diff:
+                    violations.append({
+                        "resource_type": resource_type,
+                        "resource_name": resource_name,
+                        "rule_name": rule_name,
+                        "expected_value": rule_value,
+                        "actual_value": resource[rule_name],
+                        "difference": str(diff)
+                    })
+        if not type_matched:
+            logging.warning(
+                f"Rule set for resource type '{resource_type}' matched no resource "
+                "in the IaC data; those rules were not checked."
+            )
     return violations
+
+
+def _iter_resources(iac_data):
+    """
+    Yields (resource_type, resource_name, body) for each resource in the
+    parsed IaC data.
+
+    hcl2.loads nests Terraform resources under a top level "resource"
+    key as a list of {resource_type: [{label: body}]}, so the blocks are
+    walked into flat resources here. The flat shape the rules were
+    written against ({resource_type: [body, ...]}) is accepted as well.
+    Parser metadata keys starting with "__" are dropped from bodies.
+    """
+    def clean(body):
+        return {k: v for k, v in body.items() if not str(k).startswith("__")}
+
+    resource_blocks = iac_data.get("resource")
+    if isinstance(resource_blocks, dict):
+        resource_blocks = [resource_blocks]
+    if isinstance(resource_blocks, list):
+        for block in resource_blocks:
+            if not isinstance(block, dict):
+                continue
+            for resource_type, labelled in block.items():
+                entries = labelled if isinstance(labelled, list) else [labelled]
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry and all(isinstance(v, dict) for v in entry.values()):
+                        for label, body in entry.items():
+                            if isinstance(body, dict):
+                                yield resource_type, label, clean(body)
+                    else:
+                        yield resource_type, entry.get("name", "N/A"), clean(entry)
+
+    for key, value in iac_data.items():
+        if key == "resource":
+            continue
+        entries = value if isinstance(value, list) else [value]
+        for entry in entries:
+            if isinstance(entry, dict):
+                yield key, entry.get("name", "N/A"), clean(entry)
 
 
 
@@ -193,12 +258,10 @@ def output_report(violations, output_file=None, format='text'):
         report = "No compliance violations found."
 
     if output_file:
-        try:
-            with open(output_file, 'w') as f:
-                f.write(report)
-            logging.info(f"Report written to: {output_file}")
-        except Exception as e:
-            logging.error(f"Error writing report to file: {e}")
+        # A failed write raises; main turns it into exit 1.
+        with open(output_file, 'w') as f:
+            f.write(report)
+        logging.info(f"Report written to: {output_file}")
     else:
         print(report)
 
@@ -216,7 +279,14 @@ def main():
         if not args.input_file or not args.rules_file:
             raise InvalidInputError("Both input file and rules file are required.")
 
+        if args.output_file:
+            resolved_output = os.path.realpath(args.output_file)
+            if resolved_output in (os.path.realpath(args.input_file), os.path.realpath(args.rules_file)):
+                raise InvalidInputError(f"Output path resolves to an input file, refusing to overwrite it: {args.output_file}")
+
         iac_data = load_iac_file(args.input_file)
+        if not iac_data:
+            raise InvalidInputError("IaC file parsed to an empty structure; nothing was checked.")
         rules = load_rules_file(args.rules_file)
         violations = check_compliance(iac_data, rules)
         output_report(violations, args.output_file, args.format)
@@ -240,7 +310,7 @@ def main():
 if __name__ == "__main__":
     # Example Usage:
     # To run the script:
-    # python iac_compliance_checker.py -i example.tf -r rules.yaml -o report.txt
+    # python3 main.py -i example.tf -r rules.yaml -o report.txt
     #
     # Example Terraform file (example.tf):
     # resource "aws_s3_bucket" "example" {
