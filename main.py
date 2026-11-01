@@ -18,6 +18,10 @@ class InvalidInputError(ComplianceCheckError):
     """Raised when input is invalid."""
     pass
 
+# This FileNotFoundError is a new class that shadows the builtin inside
+# this module. The loaders raise it, and main catches it through the
+# ComplianceCheckError base. Anything outside this file that catches
+# the builtin FileNotFoundError will not catch this one.
 class FileNotFoundError(ComplianceCheckError):
     """Raised when a file is not found."""
     pass
@@ -146,6 +150,9 @@ def check_compliance(iac_data, rules):
         raise InvalidInputError("Rules data must be a dictionary.")
 
     resources = list(_iter_resources(iac_data))
+    # No resources at all is an error, not a clean pass. A Terraform file
+    # with only variables and outputs has nothing this checker can check,
+    # and reporting no violations for it would be a false pass.
     if not resources:
         logging.error("No resources found in the IaC data; nothing was checked.")
         raise InvalidInputError("No resources found in the IaC data; nothing was checked.")
@@ -170,6 +177,11 @@ def check_compliance(iac_data, rules):
                         "difference": f"{rule_name} is absent; expected {rule_value!r}"
                     })
                     continue
+                # DeepDiff compares the whole property value against the rule value.
+                # For a nested block that means exact equality apart from ordering:
+                # extra keys in the resource that the rule does not mention still
+                # produce a difference and therefore a violation. A rule is a complete
+                # expected value for the property, not a subset to check within it.
                 diff = DeepDiff(resource[rule_name], rule_value, ignore_order=True)
                 if diff:
                     violations.append({
@@ -180,6 +192,10 @@ def check_compliance(iac_data, rules):
                         "actual_value": resource[rule_name],
                         "difference": str(diff)
                     })
+        # A rule set whose type matches no resource is a warning, not a
+        # violation, and does not move the exit code. A misspelled resource
+        # type in the rules file therefore passes the run, with this log line
+        # as the only trace that the rules were never applied.
         if not type_matched:
             logging.warning(
                 f"Rule set for resource type '{resource_type}' matched no resource "
@@ -214,6 +230,10 @@ def _iter_resources(iac_data):
                 for entry in entries:
                     if not isinstance(entry, dict):
                         continue
+                    # The labelled shape is recognised by shape alone: an entry whose
+                    # values are all dicts is read as label to body pairs. A resource body
+                    # whose properties all happen to be nested blocks fits that test too
+                    # and would be walked as if its properties were labels.
                     if entry and all(isinstance(v, dict) for v in entry.values()):
                         for label, body in entry.items():
                             if isinstance(body, dict):
